@@ -1,0 +1,7 @@
+{
+  "name": "Flow Fight Academy",
+  "description": "A comprehensive management system for Flow Fight Academy, including student check-ins, admin dashboard, and professor attendance tracking with GPS verification.",
+  "requestFramePermissions": [
+    "geolocation"
+  ]
+}
