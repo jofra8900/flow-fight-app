@@ -10,6 +10,7 @@ export interface Student {
     classesRemaining: number;
     notes?: string;
     createdAt: Timestamp;
+    membershipExpiresAt: Timestamp | null;
 }
 
 export interface AttendanceRecord {
@@ -62,4 +63,21 @@ export interface SedeCoordinates {
         lat: number;
         lon: number;
     };
+}
+
+export interface Payment {
+    id: string;
+    studentId: string;
+    studentName: string;
+    amount: number;
+    plan: string;
+    paymentDate: Timestamp;
+}
+
+export interface GlobalSchedule {
+    id: string;
+    day: string;
+    time: string;
+    className: string;
+    sede: 'chimbote' | 'nuevo-chimbote';
 }

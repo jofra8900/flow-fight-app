@@ -1,4 +1,5 @@
 
+
 import { initializeApp } from "firebase/app";
 import { 
     getAuth, 
@@ -24,8 +25,12 @@ import {
     getDocs,
     orderBy,
     setDoc,
-    Timestamp
+    Timestamp,
+    type OrderByDirection
 } from "firebase/firestore";
+
+// FIX: Export Timestamp to be used across the application.
+export { Timestamp };
 
 const firebaseConfig = {
     apiKey: "AIzaSyAANDkSre69Bk50Lh2JUUJEag8JTl5MqGg",
@@ -52,6 +57,8 @@ export const attendanceCollection = getCollectionRef('attendance');
 export const announcementsCollection = getCollectionRef('announcements');
 export const professorsCollection = getCollectionRef('professors');
 export const professorAttendanceCollection = getCollectionRef('professorAttendance');
+export const paymentsCollection = getCollectionRef('payments');
+export const globalScheduleCollection = getCollectionRef('globalSchedule');
 
 
 // Auth Functions
@@ -71,10 +78,12 @@ export const onAuthChange = (callback: (user: User | null) => void): Promise<Uns
 
 
 // Generic Firestore Listener
-export const createFirestoreSubscription = <T,>(collectionRef, callback: (data: T[]) => void, orderField = 'createdAt', orderDirection = 'desc') => {
+// FIX: Explicitly typed `orderDirection` as `OrderByDirection` to match Firestore's `orderBy` function signature.
+export const createFirestoreSubscription = <T,>(collectionRef, callback: (data: T[]) => void, orderField = 'createdAt', orderDirection: OrderByDirection = 'desc') => {
     const q = query(collectionRef, orderBy(orderField, orderDirection));
     return onSnapshot(q, (snapshot) => {
-        const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as T));
+        // FIX: Replaced spread operator with Object.assign to avoid "Spread types may only be created from object types" error.
+        const data = snapshot.docs.map(doc => Object.assign({ id: doc.id }, doc.data()) as T);
         callback(data);
     }, (error) => {
         console.error(`Error fetching ${collectionRef.path}:`, error);
@@ -82,11 +91,20 @@ export const createFirestoreSubscription = <T,>(collectionRef, callback: (data: 
 };
 
 // Student Functions
-export const addStudent = (studentData) => addDoc(studentsCollection, {...studentData, createdAt: Timestamp.now()});
+export const addStudent = (studentData) => {
+    const expires = new Date();
+    expires.setDate(expires.getDate() + 30);
+    return addDoc(studentsCollection, {...studentData, createdAt: Timestamp.now(), membershipExpiresAt: Timestamp.fromDate(expires)});
+};
 export const updateStudent = (id, data) => updateDoc(doc(studentsCollection, id), data);
 export const deleteStudent = (id) => deleteDoc(doc(studentsCollection, id));
-export const resetStudentClasses = (studentId: string, newClassCount: number) => {
-    return updateDoc(doc(studentsCollection, studentId), { classesRemaining: newClassCount });
+export const renewStudentMembership = (studentId: string, newClassCount: number) => {
+    const newExpiryDate = new Date();
+    newExpiryDate.setDate(newExpiryDate.getDate() + 30);
+    return updateDoc(doc(studentsCollection, studentId), { 
+        classesRemaining: newClassCount,
+        membershipExpiresAt: Timestamp.fromDate(newExpiryDate)
+    });
 };
 
 
@@ -111,11 +129,18 @@ export const getProfessorByPin = async (pin: string) => {
 
 export const getProfessorSchedule = (professorId, callback) => {
     const scheduleCollection = collection(db, `artifacts/${appId}/public/data/professors/${professorId}/schedule`);
-    return onSnapshot(scheduleCollection, (snapshot) => {
+    const q = query(scheduleCollection, orderBy("time", "asc"));
+    return onSnapshot(q, (snapshot) => {
         const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
         callback(data);
     });
 };
+export const fetchProfessorScheduleOnce = async (professorId: string) => {
+    const scheduleCollection = collection(db, `artifacts/${appId}/public/data/professors/${professorId}/schedule`);
+    const q = query(scheduleCollection, orderBy("time", "asc"));
+    const querySnapshot = await getDocs(q);
+    return querySnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+}
 export const addProfessorSchedule = (professorId: string, schedule: any) => {
     const scheduleCollection = collection(db, `artifacts/${appId}/public/data/professors/${professorId}/schedule`);
     return addDoc(scheduleCollection, schedule);
@@ -131,9 +156,19 @@ export const deleteProfessor = (id) => deleteDoc(doc(professorsCollection, id));
 
 export const addProfessorAttendance = (attendanceData) => addDoc(professorAttendanceCollection, {...attendanceData, timestamp: Timestamp.now()});
 
+// Payment Functions
+export const addPayment = (paymentData) => addDoc(paymentsCollection, {...paymentData, paymentDate: Timestamp.now()});
+
+// Global Schedule Functions
+export const addGlobalSchedule = (scheduleData) => addDoc(globalScheduleCollection, scheduleData);
+export const deleteGlobalSchedule = (id) => deleteDoc(doc(globalScheduleCollection, id));
+
 
 // Generic get all for exports
-export const getAllDocs = async (collectionRef) => {
-    const snapshot = await getDocs(query(collectionRef, orderBy("timestamp", "desc")));
-    return snapshot.docs.map(doc => doc.data());
+// FIX: Made `getAllDocs` a generic function and added an optional `orderByField` parameter.
+// This provides type safety at call sites and prevents runtime errors for collections without a 'timestamp' field.
+export const getAllDocs = async <T>(collectionRef, orderByField?: string): Promise<T[]> => {
+    const q = orderByField ? query(collectionRef, orderBy(orderByField, "desc")) : query(collectionRef);
+    const snapshot = await getDocs(q);
+    return snapshot.docs.map(doc => doc.data() as T);
 }

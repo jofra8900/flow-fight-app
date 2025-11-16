@@ -5,7 +5,7 @@ import {
     BarChart, Bar, PieChart, Pie, Cell
 } from 'recharts';
 import type { User } from 'firebase/auth';
-import type { Student, AttendanceRecord, Announcement, Professor, Schedule, ProfessorAttendance, SedeCoordinates } from './types';
+import type { Student, AttendanceRecord, Announcement, Professor, Schedule, ProfessorAttendance, SedeCoordinates, Payment, GlobalSchedule } from './types';
 import { ADMIN_PIN, PLAN_DETAILS, CLASS_OPTIONS, DAYS_OF_WEEK, SEDE_COORDINATES } from './constants';
 import * as fb from './services/firebaseService';
 
@@ -15,10 +15,9 @@ const Spinner: React.FC<{ size?: 'sm' | 'md' }> = ({ size = 'md' }) => (
     <div className={`border-4 border-gray-600 border-t-lime-500 rounded-full animate-spin ${size === 'sm' ? 'w-5 h-5' : 'w-8 h-8'}`}></div>
 );
 
-
-const IonIcon: React.FC<{ name: string; className?: string }> = ({ name, className }) => (
+const IonIcon: React.FC<{ name: string; className?: string; title?: string }> = ({ name, className, title }) => (
     // @ts-ignore
-    <ion-icon name={name} class={className}></ion-icon>
+    <ion-icon name={name} class={className} title={title}></ion-icon>
 );
 
 const haversineDistance = (coords1: { lat: number; lon: number }, coords2: { lat: number; lon: number }): number => {
@@ -85,16 +84,143 @@ const Modal: React.FC<{ children: React.ReactNode; onClose: () => void; title: s
     </div>
 );
 
+// --- CUSTOM HOOKS ---
+const useProfessorCheckinStatus = (
+    professor: Professor, 
+    globalSchedule: GlobalSchedule[], 
+    showToast: (msg: string, type?: 'success' | 'error') => void
+) => {
+    const [currentClass, setCurrentClass] = useState<Schedule | GlobalSchedule | null>(null);
+    const [checkinState, setCheckinState] = useState<{
+        status: 'idle' | 'checking' | 'checked-in' | 'no-class' | 'error';
+        message: string;
+    }>({
+        status: 'idle',
+        message: 'Verificando horario...',
+    });
+
+    const checkAvailability = useCallback(async () => {
+        const now = new Date();
+        const today = DAYS_OF_WEEK[now.getDay()];
+        const gracePeriodMinutes = 15;
+        const classWindowMinutes = 90;
+
+        const checkTimeWindow = (classTimeStr: string) => {
+            const [classHour, classMinute] = classTimeStr.split(':').map(Number);
+            const classTimeMinutes = classHour * 60 + classMinute;
+            const currentTimeMinutes = now.getHours() * 60 + now.getMinutes();
+            return currentTimeMinutes >= (classTimeMinutes - gracePeriodMinutes) &&
+                   currentTimeMinutes < (classTimeMinutes + classWindowMinutes);
+        };
+
+        const professorSchedule = await fb.fetchProfessorScheduleOnce(professor.id) as Schedule[];
+        let foundClass: Schedule | GlobalSchedule | undefined = professorSchedule.find(s => s.day === today && checkTimeWindow(s.time));
+
+        if (!foundClass) {
+            foundClass = globalSchedule.find(s => s.day === today && s.sede === professor.sede && checkTimeWindow(s.time));
+        }
+        
+        if (!foundClass) {
+            setCheckinState({ status: 'no-class', message: 'No tienes una clase programada ahora.' });
+            setCurrentClass(null);
+            return;
+        }
+
+        const checkinsToday = await fb.getAllDocs<ProfessorAttendance>(fb.professorAttendanceCollection, 'timestamp');
+        const hasCheckedIn = checkinsToday.some(a => 
+            a.professorId === professor.id &&
+            a.className === foundClass!.className &&
+            a.timestamp.toDate() > new Date(new Date().setHours(0,0,0,0))
+        );
+
+        if (hasCheckedIn) {
+             setCheckinState({ status: 'checked-in', message: `Ya marcaste asistencia para ${foundClass.className}` });
+             setCurrentClass(foundClass);
+             return;
+        }
+
+        setCheckinState({ status: 'idle', message: `Listo para marcar para ${foundClass.className}` });
+        setCurrentClass(foundClass);
+
+    }, [professor.id, professor.sede, globalSchedule]);
+
+    useEffect(() => {
+        checkAvailability();
+        const interval = setInterval(checkAvailability, 60000);
+        return () => clearInterval(interval);
+    }, [checkAvailability]);
+
+    const handleCheckin = async () => {
+        if (!currentClass) {
+            showToast('No hay una clase activa para marcar.', 'error');
+            return;
+        }
+        
+        setCheckinState({ status: 'checking', message: 'Obteniendo ubicación...' });
+        
+        try {
+            const now = new Date();
+            const position = await new Promise<GeolocationPosition>((resolve, reject) => {
+                navigator.geolocation.getCurrentPosition(resolve, reject, { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 });
+            });
+            
+            setCheckinState({ status: 'checking', message: 'Verificando distancia...' });
+            const userCoords = { lat: position.coords.latitude, lon: position.coords.longitude };
+            const sedeCoords = SEDE_COORDINATES[professor.sede];
+            if (!sedeCoords) throw new Error(`Coordenadas para la sede "${professor.sede}" no encontradas.`);
+
+            const distance = haversineDistance(userCoords, sedeCoords);
+            if (distance > 500) throw new Error(`Estás a ${Math.round(distance)}m. Debes estar a menos de 500m.`);
+            
+            const [classHour, classMinute] = currentClass.time.split(':').map(Number);
+            const classTimeToday = new Date();
+            classTimeToday.setHours(classHour, classMinute, 0, 0);
+
+            const minutesLate = (now.getTime() - classTimeToday.getTime()) / 60000;
+            const status = minutesLate > 10 ? 'TARDE' : 'EN HORA';
+            
+            await fb.addProfessorAttendance({
+                professorId: professor.id,
+                professorName: professor.name,
+                sede: professor.sede,
+                className: currentClass.className,
+                status,
+            });
+
+            showToast(`Asistencia registrada (${status})`);
+            checkAvailability();
+
+        } catch (err: any) {
+            let errorMessage = 'Ocurrió un error inesperado al verificar la ubicación.';
+            if (err instanceof Error) {
+                errorMessage = err.message;
+            }
+            if (errorMessage.includes("User denied Geolocation")) {
+                errorMessage = "Acceso a la ubicación denegado. Debes permitirlo para marcar asistencia.";
+            } else if (errorMessage.includes("Timeout expired")) {
+                errorMessage = "No se pudo obtener tu ubicación a tiempo. Revisa tu conexión e inténtalo de nuevo.";
+            }
+            
+            showToast(errorMessage, 'error');
+            setCheckinState({status: 'error', message: errorMessage});
+            setTimeout(() => checkAvailability(), 3000);
+        }
+    };
+
+    return { checkinState, currentClass, handleCheckin };
+}
+
 
 // --- MAIN APP COMPONENT ---
 
 export default function App() {
-    type AppState = 'roleSelection' | 'adminLogin' | 'professorLogin' | 'kiosko' | 'adminPanel';
+    type AppState = 'roleSelection' | 'adminLogin' | 'professorLogin' | 'kiosko' | 'adminPanel' | 'professorDashboard';
     const [appState, setAppState] = useState<AppState>('roleSelection');
     const [user, setUser] = useState<User | null>(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState('');
     const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
+    const [loggedInProfessor, setLoggedInProfessor] = useState<Professor | null>(null);
 
     // Data states
     const [students, setStudents] = useState<Student[]>([]);
@@ -102,6 +228,8 @@ export default function App() {
     const [announcements, setAnnouncements] = useState<Announcement[]>([]);
     const [professors, setProfessors] = useState<Professor[]>([]);
     const [professorAttendance, setProfessorAttendance] = useState<ProfessorAttendance[]>([]);
+    const [payments, setPayments] = useState<Payment[]>([]);
+    const [globalSchedule, setGlobalSchedule] = useState<GlobalSchedule[]>([]);
 
     // Toast handler
     useEffect(() => {
@@ -121,7 +249,7 @@ export default function App() {
             setUser(user);
             if (user) {
                 setAppState('adminPanel');
-            } else if (appState === 'adminPanel') {
+            } else if (appState === 'adminPanel' || appState === 'professorDashboard') {
                 setAppState('roleSelection');
             }
             setLoading(false);
@@ -139,6 +267,8 @@ export default function App() {
         const unsubAnnouncements = fb.createFirestoreSubscription<Announcement>(fb.announcementsCollection, setAnnouncements);
         const unsubProfessors = fb.createFirestoreSubscription<Professor>(fb.professorsCollection, setProfessors, 'name', 'asc');
         const unsubProfAttendance = fb.createFirestoreSubscription<ProfessorAttendance>(fb.professorAttendanceCollection, setProfessorAttendance);
+        const unsubPayments = fb.createFirestoreSubscription<Payment>(fb.paymentsCollection, setPayments, 'paymentDate', 'desc');
+        const unsubGlobalSchedule = fb.createFirestoreSubscription<GlobalSchedule>(fb.globalScheduleCollection, setGlobalSchedule, 'time', 'asc');
 
         return () => {
             unsubStudents();
@@ -146,6 +276,8 @@ export default function App() {
             unsubAnnouncements();
             unsubProfessors();
             unsubProfAttendance();
+            unsubPayments();
+            unsubGlobalSchedule();
         };
     }, []);
 
@@ -167,6 +299,7 @@ export default function App() {
 
     const handleLogout = async () => {
         await fb.logout();
+        setLoggedInProfessor(null);
         setAppState('roleSelection');
     };
 
@@ -185,9 +318,24 @@ export default function App() {
             case 'adminLogin':
                 return <LoginScreen handleLogin={handleLogin} error={error} loading={loading} setAppState={setAppState}/>;
             case 'professorLogin':
-                return <ProfessorLoginScreen setAppState={setAppState} showToast={showToast} sedeCoordinates={SEDE_COORDINATES} />;
+                return <ProfessorLoginScreen 
+                    setAppState={setAppState} 
+                    setLoggedInProfessor={setLoggedInProfessor} 
+                />;
             case 'kiosko':
-                return <KioskoScreen students={students} isStandalone={true} setAppState={setAppState} showToast={showToast} />;
+                return <KioskoScreen students={students} isStandalone={true} setAppState={setAppState} showToast={showToast} globalSchedule={globalSchedule} />;
+            case 'professorDashboard':
+                if (loggedInProfessor) {
+                    return <ProfessorDashboardScreen 
+                                professor={loggedInProfessor} 
+                                attendance={attendance} 
+                                onLogout={() => { setLoggedInProfessor(null); setAppState('roleSelection'); }}
+                                globalSchedule={globalSchedule}
+                                showToast={showToast}
+                           />;
+                }
+                 setAppState('professorLogin');
+                 return null;
             case 'adminPanel':
                 if (user) {
                     return <AdminPanel
@@ -197,6 +345,8 @@ export default function App() {
                         announcements={announcements}
                         professors={professors}
                         professorAttendance={professorAttendance}
+                        payments={payments}
+                        globalSchedule={globalSchedule}
                         showToast={showToast}
                     />;
                 }
@@ -211,7 +361,7 @@ export default function App() {
         <div className="max-w-7xl mx-auto p-4 md:p-8">
             <header className="flex items-center justify-between mb-8 relative">
                  <div className="w-full flex justify-center">
-                    <img src="https://i.postimg.cc/YSnL9Hjn/Designer-(1).png" alt="Flow Fight Logo" className="h-16 md:h-20 object-contain cursor-pointer" onClick={() => appState !== 'adminPanel' && setAppState('roleSelection')} />
+                    <img src="https://i.postimg.cc/YSnL9Hjn/Designer-(1).png" alt="Flow Fight Logo" className="h-16 md:h-20 object-contain cursor-pointer" onClick={() => appState !== 'adminPanel' && appState !== 'professorDashboard' && setAppState('roleSelection')} />
                 </div>
             </header>
 
@@ -228,7 +378,7 @@ export default function App() {
 
 // --- APP SCREENS ---
 
-const RoleSelectionScreen: React.FC<{ setAppState: (state: any) => void }> = ({ setAppState }) => {
+const RoleSelectionScreen: React.FC<{ setAppState: (state: any) => void }> = React.memo(({ setAppState }) => {
     const RoleButton: React.FC<{ icon: string; title: string; onClick: () => void }> = ({ icon, title, onClick }) => (
         <button
             onClick={onClick}
@@ -248,9 +398,9 @@ const RoleSelectionScreen: React.FC<{ setAppState: (state: any) => void }> = ({ 
             </div>
         </div>
     );
-};
+});
 
-const LoginScreen: React.FC<{ handleLogin: any, error: string, loading: boolean, setAppState: (state:any) => void }> = ({ handleLogin, error, loading, setAppState }) => {
+const LoginScreen: React.FC<{ handleLogin: any, error: string, loading: boolean, setAppState: (state:any) => void }> = React.memo(({ handleLogin, error, loading, setAppState }) => {
     return (
         <div className="bg-gray-800 p-8 rounded-lg shadow-xl max-w-sm mx-auto fade-in">
             <h2 className="text-xl font-semibold text-center text-gray-300 mb-6">Acceso de Administrador</h2>
@@ -273,9 +423,9 @@ const LoginScreen: React.FC<{ handleLogin: any, error: string, loading: boolean,
             </button>
         </div>
     );
-};
+});
 
-const ProfessorLoginScreen: React.FC<{ setAppState: (state: any) => void; showToast: (msg: string, type?: 'success' | 'error') => void; sedeCoordinates: SedeCoordinates | null; }> = ({ setAppState, showToast, sedeCoordinates }) => {
+const ProfessorLoginScreen: React.FC<{ setAppState: (state: any) => void; setLoggedInProfessor: (prof: Professor) => void; }> = ({ setAppState, setLoggedInProfessor }) => {
     const [pin, setPin] = useState('');
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState('');
@@ -301,7 +451,7 @@ const ProfessorLoginScreen: React.FC<{ setAppState: (state: any) => void; showTo
         setPin('');
     };
 
-    const checkProfessorAttendance = useCallback(async () => {
+    const handleProfessorLogin = useCallback(async () => {
         if (pin.length !== 4) return;
         setLoading(true);
         setError('');
@@ -310,68 +460,8 @@ const ProfessorLoginScreen: React.FC<{ setAppState: (state: any) => void; showTo
             if (!professor) {
                 throw new Error('PIN incorrecto.');
             }
-
-            if (!sedeCoordinates) {
-                throw new Error('Las coordenadas de la sede no están configuradas. Contacte al administrador.');
-            }
-
-            const now = new Date();
-            const today = DAYS_OF_WEEK[now.getDay()];
-            
-            let professorSchedule: Schedule[] = [];
-            const unsub = fb.getProfessorSchedule(professor.id, (scheduleData: Schedule[]) => {
-                professorSchedule = scheduleData;
-            });
-            await new Promise(resolve => setTimeout(resolve, 500)); // give snapshot time
-            unsub();
-
-
-            const currentClass = professorSchedule.find(s => {
-                if (s.day !== today) return false;
-                const [classHour, classMinute] = s.time.split(':').map(Number);
-                const classTimeMinutes = classHour * 60 + classMinute;
-                const currentTimeMinutes = now.getHours() * 60 + now.getMinutes();
-                return currentTimeMinutes >= classTimeMinutes && currentTimeMinutes < (classTimeMinutes + 60);
-            });
-
-
-            if (!currentClass) {
-                throw new Error('No tienes una clase programada en este momento.');
-            }
-
-            const position = await new Promise<GeolocationPosition>((resolve, reject) => {
-                navigator.geolocation.getCurrentPosition(resolve, reject, { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 });
-            });
-            
-            const userCoords = { lat: position.coords.latitude, lon: position.coords.longitude };
-            const sedeCoords = sedeCoordinates[professor.sede];
-            if (!sedeCoords || !sedeCoords.lat || !sedeCoords.lon) {
-                 throw new Error(`Coordenadas para la sede "${professor.sede}" no encontradas.`);
-            }
-
-            const distance = haversineDistance(userCoords, sedeCoords);
-
-            if (distance > 500) {
-                 throw new Error(`Debes estar en la academia para marcar asistencia. Estás a ${Math.round(distance)} metros de distancia.`);
-            }
-            
-            const [classHour, classMinute] = currentClass.time.split(':').map(Number);
-            const classTimeToday = new Date();
-            classTimeToday.setHours(classHour, classMinute, 0, 0);
-
-            const minutesLate = (now.getTime() - classTimeToday.getTime()) / 60000;
-            const status = minutesLate > 10 ? 'TARDE' : 'EN HORA';
-            
-            await fb.addProfessorAttendance({
-                professorId: professor.id,
-                professorName: professor.name,
-                sede: professor.sede,
-                className: currentClass.className,
-                status,
-            });
-
-            showToast(`Asistencia de ${professor.name} registrada (${status})`);
-            setAppState('roleSelection');
+            setLoggedInProfessor(professor);
+            setAppState('professorDashboard');
 
         } catch (err: any) {
             setError(err.message);
@@ -383,13 +473,13 @@ const ProfessorLoginScreen: React.FC<{ setAppState: (state: any) => void; showTo
         } finally {
             setLoading(false);
         }
-    }, [pin, showToast, setAppState, sedeCoordinates]);
+    }, [pin, setAppState, setLoggedInProfessor]);
 
     useEffect(() => {
         if (pin.length === 4) {
-            checkProfessorAttendance();
+            handleProfessorLogin();
         }
-    }, [pin, checkProfessorAttendance]);
+    }, [pin, handleProfessorLogin]);
     
 
     const pinDots = Array(4).fill(0).map((_, i) => (
@@ -435,7 +525,8 @@ const KioskoScreen: React.FC<{
     isStandalone: boolean;
     setAppState: (state: any) => void;
     showToast: (msg: string, type?: 'success' | 'error') => void;
-}> = ({ students, isStandalone, setAppState, showToast }) => {
+    globalSchedule: GlobalSchedule[];
+}> = ({ students, isStandalone, setAppState, showToast, globalSchedule }) => {
     const [selectedSede, setSelectedSede] = useState('todas');
     const [selectedStudent, setSelectedStudent] = useState<Student | null>(null);
 
@@ -458,6 +549,13 @@ const KioskoScreen: React.FC<{
             showToast('El alumno no tiene clases restantes.', 'error');
             return;
         }
+        
+        const now = new Date();
+        const expiryDate = selectedStudent.membershipExpiresAt?.toDate();
+        if (!expiryDate || now > expiryDate) {
+            showToast('La membresía del alumno ha vencido.', 'error');
+            return;
+        }
 
         const newClasses = selectedStudent.classesRemaining - 1;
         try {
@@ -475,6 +573,12 @@ const KioskoScreen: React.FC<{
             console.error(error);
         }
     };
+    
+    const todaysScheduleForSede = useMemo(() => {
+        if (!selectedStudent) return [];
+        const today = DAYS_OF_WEEK[new Date().getDay()];
+        return globalSchedule.filter(s => s.day === today && s.sede === selectedStudent.sede);
+    }, [globalSchedule, selectedStudent]);
 
     return (
         <div className="fade-in">
@@ -495,10 +599,10 @@ const KioskoScreen: React.FC<{
             </div>
             <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4 md:gap-6">
                 {filteredStudents.length > 0 ? filteredStudents.map(student => {
-                    const isExpired = student.classesRemaining <= 0;
+                    const isExpired = student.classesRemaining <= 0 || (student.membershipExpiresAt && student.membershipExpiresAt.toDate() < new Date());
                     return (
                         <div key={student.id} onClick={() => setSelectedStudent(student)}
-                            className={`student-card cursor-pointer bg-gray-800 p-4 rounded-lg text-center transition-smooth card-hover ${isExpired ? 'opacity-60' : ''}`}>
+                            className={`student-card group cursor-pointer bg-gray-800 p-4 rounded-lg text-center transition-smooth card-hover ${isExpired ? 'opacity-60' : ''}`}>
                             <img src={student.photoUrl} alt={student.name} className={`w-28 h-28 object-cover rounded-full mx-auto mb-3 border-4 ${isExpired ? 'border-red-500' : 'border-gray-600 group-hover:border-lime-500'}`} />
                             <h3 className="font-bold text-lg truncate">{student.name}</h3>
                         </div>
@@ -513,15 +617,15 @@ const KioskoScreen: React.FC<{
                         <p className="text-lg font-semibold mb-4">
                             {selectedStudent.classesRemaining > 0 ? `Te quedan ${selectedStudent.classesRemaining} clases.` : '¡Plan vencido!'}
                         </p>
-                        {selectedStudent.classesRemaining > 0 && (
+                        {selectedStudent.classesRemaining > 0 && (!selectedStudent.membershipExpiresAt || selectedStudent.membershipExpiresAt.toDate() > new Date()) && (
                              <>
                                 <p className="text-gray-400 mb-6">¿A qué clase vas a entrar?</p>
                                 <div className="flex flex-col space-y-3">
-                                    {CLASS_OPTIONS.map(className => (
-                                        <button key={className} onClick={() => handleCheckin(className)} className="w-full bg-gray-700 text-white font-bold py-3 px-4 rounded-lg hover:bg-gray-600 transition-smooth">
-                                            {className}
+                                    {todaysScheduleForSede.length > 0 ? todaysScheduleForSede.map(scheduleItem => (
+                                        <button key={scheduleItem.id} onClick={() => handleCheckin(scheduleItem.className)} className="w-full bg-gray-700 text-white font-bold py-3 px-4 rounded-lg hover:bg-gray-600 transition-smooth">
+                                            {scheduleItem.time} - {scheduleItem.className}
                                         </button>
-                                    ))}
+                                    )) : <p className="text-gray-500">No hay clases programadas para hoy en esta sede.</p>}
                                 </div>
                             </>
                         )}
@@ -548,10 +652,12 @@ const AdminPanel: React.FC<{
     announcements: Announcement[];
     professors: Professor[];
     professorAttendance: ProfessorAttendance[];
+    payments: Payment[];
+    globalSchedule: GlobalSchedule[];
     showToast: (msg: string, type?: 'success' | 'error') => void;
 }> = (props) => {
-    const TABS = ['Dashboard', 'Kiosko', 'Alumnos', 'Asistencia', 'Profesores', 'Avisos', 'Exportar'];
-    type TabName = 'Dashboard' | 'Kiosko' | 'Alumnos' | 'Asistencia' | 'Profesores' | 'Avisos' | 'Exportar';
+    const TABS = ['Dashboard', 'Kiosko', 'Alumnos', 'Pagos', 'Horarios', 'Asistencia', 'Profesores', 'Avisos', 'Reportes'];
+    type TabName = 'Dashboard' | 'Kiosko' | 'Alumnos' | 'Pagos' | 'Horarios' | 'Asistencia' | 'Profesores' | 'Avisos' | 'Reportes';
 
     const [activeTab, setActiveTab] = useState<TabName>('Dashboard');
     const [adminUnlocked, setAdminUnlocked] = useState(false);
@@ -577,25 +683,31 @@ const AdminPanel: React.FC<{
         setPinModalOpen(false);
         if (targetTab) {
             setActiveTab(targetTab);
-// FIX: `showToast` is a property of `props` and was not destructured. Called as `props.showToast`.
             targetTab && props.showToast('Modo admin desbloqueado', 'success');
             setTargetTab(null);
         }
     };
 
     const studentsAtRiskCount = useMemo(() => {
-        return props.students.filter(s => s.classesRemaining > 0 && s.classesRemaining <= 3).length;
+        const now = new Date();
+        const sevenDaysFromNow = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+        return props.students.filter(s => {
+             const expiryDate = s.membershipExpiresAt?.toDate();
+             return (s.classesRemaining > 0 && s.classesRemaining <= 3) || (expiryDate && expiryDate > now && expiryDate <= sevenDaysFromNow);
+        }).length;
     }, [props.students]);
 
     const renderActiveTab = () => {
         switch(activeTab) {
             case 'Dashboard': return <DashboardView students={props.students} attendance={props.attendance} />;
-            case 'Kiosko': return <KioskoScreen students={props.students} isStandalone={false} setAppState={() => {}} showToast={props.showToast} />;
+            case 'Kiosko': return <KioskoScreen students={props.students} isStandalone={false} setAppState={() => {}} showToast={props.showToast} globalSchedule={props.globalSchedule} />;
             case 'Alumnos': return <AlumnosView students={props.students} showToast={props.showToast} setModal={setModal} />;
+            case 'Pagos': return <PagosView students={props.students} payments={props.payments} showToast={props.showToast} />;
+            case 'Horarios': return <HorariosView schedule={props.globalSchedule} showToast={props.showToast} />;
             case 'Asistencia': return <AsistenciaView attendance={props.attendance} />;
             case 'Profesores': return <ProfesoresView professors={props.professors} showToast={props.showToast} setModal={setModal} />;
             case 'Avisos': return <AvisosView announcements={props.announcements} showToast={props.showToast} adminUnlocked={adminUnlocked} onUnlockRequest={() => setPinModalOpen(true)} setModal={setModal} />;
-            case 'Exportar': return <ExportarView showToast={props.showToast} />;
+            case 'Reportes': return <ReportesView students={props.students} attendance={props.attendance} professorAttendance={props.professorAttendance} showToast={props.showToast} />;
             default: return null;
         }
     }
@@ -618,9 +730,13 @@ const AdminPanel: React.FC<{
 
     return (
         <div className="fade-in">
-            <button onClick={props.handleLogout} className="absolute top-4 right-4 text-gray-400 hover:text-white transition-smooth z-10">
-                <IonIcon name="log-out-outline" className="text-3xl"/>
-            </button>
+             <div className="flex justify-between items-center mb-6 border-b border-gray-700 pb-4">
+                <h1 className="text-2xl font-bold text-white">Panel de Administrador</h1>
+                <button onClick={props.handleLogout} className="bg-gray-700 hover:bg-red-500/50 text-white font-semibold py-2 px-4 rounded-lg transition-smooth flex items-center space-x-2">
+                    <IonIcon name="log-out-outline" />
+                    <span>Salir</span>
+                </button>
+            </div>
             
             <nav className="flex items-center justify-center space-x-1 md:space-x-2 mb-8 bg-gray-800 p-2 rounded-lg overflow-x-auto">
                 {TABS.map(tab => (
@@ -658,12 +774,14 @@ const AdminPanel: React.FC<{
 };
 
 const DashboardView: React.FC<{ students: Student[], attendance: AttendanceRecord[] }> = ({ students, attendance }) => {
-    const stats = useMemo(() => ({
+    const stats = useMemo(() => {
+        const now = new Date();
+        return {
         total: students.length,
-        active: students.filter(s => s.classesRemaining > 0).length,
-        expired: students.filter(s => s.classesRemaining <= 0).length,
+        active: students.filter(s => s.classesRemaining > 0 && s.membershipExpiresAt && s.membershipExpiresAt.toDate() > now).length,
+        expired: students.filter(s => s.classesRemaining <= 0 || (s.membershipExpiresAt && s.membershipExpiresAt.toDate() <= now)).length,
         today: attendance.filter(a => new Date(a.timestamp.seconds * 1000).toDateString() === new Date().toDateString()).length,
-    }), [students, attendance]);
+    }}, [students, attendance]);
 
     const sedeData = useMemo(() => {
         const data = students.reduce((acc, student) => {
@@ -675,9 +793,16 @@ const DashboardView: React.FC<{ students: Student[], attendance: AttendanceRecor
     }, [students]);
     
     const studentsAtRisk = useMemo(() => {
+        const now = new Date();
+        const sevenDaysFromNow = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
         return students
-            .filter(s => s.classesRemaining > 0 && s.classesRemaining <= 3)
-            .sort((a, b) => a.classesRemaining - b.classesRemaining);
+            .filter(s => {
+                const expiryDate = s.membershipExpiresAt?.toDate();
+                const isExpiringSoon = expiryDate && expiryDate > now && expiryDate <= sevenDaysFromNow;
+                const lowClasses = s.classesRemaining > 0 && s.classesRemaining <= 3;
+                return isExpiringSoon || lowClasses;
+            })
+            .sort((a, b) => (a.membershipExpiresAt?.seconds || 0) - (b.membershipExpiresAt?.seconds || 0));
     }, [students]);
 
     const COLORS = ['#84cc16', '#22c55e', '#3b82f6', '#f59e0b'];
@@ -696,10 +821,13 @@ const DashboardView: React.FC<{ students: Student[], attendance: AttendanceRecor
                 <div className="bg-gray-800 p-6 rounded-lg shadow-lg">
                     <h3 className="text-xl font-semibold mb-4 flex items-center">
                         <IonIcon name="warning" className="text-yellow-500 text-2xl mr-2" />
-                        Alumnos por Vencer (≤3 clases)
+                        Alertas de Membresía
                     </h3>
                     <div className="space-y-2 max-h-64 overflow-y-auto pr-2">
-                        {studentsAtRisk.length > 0 ? studentsAtRisk.map(s => (
+                        {studentsAtRisk.length > 0 ? studentsAtRisk.map(s => {
+                            const expiryDate = s.membershipExpiresAt?.toDate();
+                            const daysLeft = expiryDate ? Math.ceil((expiryDate.getTime() - new Date().getTime()) / (1000 * 3600 * 24)) : 0;
+                             return (
                              <div key={s.id} className="flex items-center justify-between bg-gray-700 p-3 rounded-lg pulse-warning">
                                 <div className="flex items-center space-x-3">
                                     <img src={s.photoUrl} alt={s.name} className="w-10 h-10 rounded-full object-cover" />
@@ -708,9 +836,12 @@ const DashboardView: React.FC<{ students: Student[], attendance: AttendanceRecor
                                         <p className="text-xs text-gray-400 capitalize">{s.sede}</p>
                                     </div>
                                 </div>
+                                <div className='text-right'>
                                 <span className="bg-yellow-500 text-gray-900 text-xs font-bold px-2 py-1 rounded">{s.classesRemaining} {s.classesRemaining === 1 ? 'clase' : 'clases'}</span>
+                                {expiryDate && daysLeft <= 7 && <p className="text-xs text-yellow-400 mt-1">Vence en {daysLeft} día(s)</p>}
+                                </div>
                             </div>
-                        )) : <p className="text-gray-400 text-center py-4">¡Todo bien! No hay alumnos próximos a vencer.</p>}
+                        )}) : <p className="text-gray-400 text-center py-4">¡Todo bien! No hay alumnos próximos a vencer.</p>}
                     </div>
                 </div>
                  <div className="bg-gray-800 p-6 rounded-lg shadow-lg h-80">
@@ -785,7 +916,7 @@ const AlumnosView: React.FC<{ students: Student[], showToast: (msg: string, type
         });
     };
 
-    const handleReset = (student: Student) => {
+    const handleRenew = (student: Student) => {
         const planDetails = PLAN_DETAILS[student.plan];
         if (!planDetails) {
             showToast('El plan del alumno no es válido', 'error');
@@ -793,18 +924,31 @@ const AlumnosView: React.FC<{ students: Student[], showToast: (msg: string, type
         }
         setModal({
             type: 'confirm',
-            title: `¿Resetear clases de ${student.name}?`,
-            text: `Se asignarán ${planDetails.classes} clases según su plan actual.`,
+            title: `¿Renovar a ${student.name}?`,
+            text: `Se asignarán ${planDetails.classes} clases y se extenderá su membresía por 30 días.`,
             onConfirm: async () => {
                 try {
-                    await fb.resetStudentClasses(student.id, planDetails.classes);
-                    showToast(`Clases de ${student.name} reseteadas a ${planDetails.classes}`);
+                    await fb.renewStudentMembership(student.id, planDetails.classes);
+                    showToast(`Membresía de ${student.name} renovada.`);
                 } catch (e) {
-                    showToast('Error al resetear clases', 'error');
+                    showToast('Error al renovar membresía', 'error');
                 }
                 setModal(null);
             }
         });
+    };
+    
+    const getMembershipStatus = (student: Student) => {
+        const now = new Date();
+        const expiryDate = student.membershipExpiresAt?.toDate();
+        if (!expiryDate || now > expiryDate) {
+            return { status: 'expired', icon: 'alert-circle', color: 'text-red-500', text: 'Membresía Vencida' };
+        }
+        const sevenDaysFromNow = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+        if (expiryDate <= sevenDaysFromNow) {
+            return { status: 'expiring', icon: 'time-outline', color: 'text-yellow-500', text: `Vence el ${expiryDate.toLocaleDateString()}` };
+        }
+        return { status: 'active', icon: null, color: '', text: '' };
     };
 
     return (
@@ -847,15 +991,19 @@ const AlumnosView: React.FC<{ students: Student[], showToast: (msg: string, type
                  <h3 className="text-xl font-semibold mb-4">Lista de Alumnos ({students.length})</h3>
                  <div className="space-y-3 max-h-[60vh] overflow-y-auto pr-2">
                     {students.map(student => {
-                        const isExpired = student.classesRemaining <= 0;
+                        const status = getMembershipStatus(student);
+                        const isInactive = student.classesRemaining <= 0 || status.status === 'expired';
                         return (
-                         <div key={student.id} className={`bg-gray-800 p-4 rounded-lg flex items-center justify-between transition-smooth ${isExpired ? 'bg-red-900/20' : ''}`}>
+                         <div key={student.id} className={`bg-gray-800 p-4 rounded-lg flex items-center justify-between transition-smooth ${isInactive ? 'bg-red-900/20' : ''}`}>
                             <div className="flex items-center space-x-4 min-w-0">
-                                <img src={student.photoUrl} alt={student.name} className={`w-12 h-12 object-cover rounded-full ${isExpired ? 'border-2 border-red-500' : ''}`} />
+                                <img src={student.photoUrl} alt={student.name} className={`w-12 h-12 object-cover rounded-full ${isInactive ? 'border-2 border-red-500' : ''}`} />
                                 <div className="min-w-0">
-                                    <h4 className="font-semibold truncate">{student.name}</h4>
-                                    <p className={`text-sm ${isExpired ? 'text-red-400 font-semibold' : 'text-gray-400'}`}>
-                                        Clases restantes: {student.classesRemaining}
+                                    <div className="flex items-center space-x-2">
+                                        <h4 className="font-semibold truncate">{student.name}</h4>
+                                        {status.icon && <IonIcon name={status.icon} className={`${status.color} text-lg`} title={status.text} />}
+                                    </div>
+                                    <p className={`text-sm ${isInactive ? 'text-red-400 font-semibold' : 'text-gray-400'}`}>
+                                        Clases: {student.classesRemaining}
                                     </p>
                                 </div>
                             </div>
@@ -868,7 +1016,7 @@ const AlumnosView: React.FC<{ students: Student[], showToast: (msg: string, type
                                         </div>
                                     </div>
                                 )}
-                                <button onClick={() => handleReset(student)} className="text-lime-400 hover:text-lime-300 transition-smooth"><IonIcon name="sync-outline" /></button>
+                                <button onClick={() => handleRenew(student)} title="Renovar Membresía" className="text-lime-400 hover:text-lime-300 transition-smooth"><IonIcon name="sync-outline" /></button>
                                 <button onClick={() => setModal({ type: 'editStudent', student })} className="text-blue-400 hover:text-blue-300 transition-smooth"><IonIcon name="pencil-outline" /></button>
                                 <button onClick={() => handleDelete(student)} className="text-red-400 hover:text-red-300 transition-smooth"><IonIcon name="trash-outline" /></button>
                             </div>
@@ -1112,10 +1260,39 @@ const AvisosView: React.FC<{ announcements: Announcement[], showToast: any, admi
     );
 };
 
-const ExportarView: React.FC<{ showToast: (msg: string, type?: 'success'|'error') => void }> = ({ showToast }) => {
-    const handleExport = async (collectionRef, filename, headers, mapping) => {
+const ReportesView: React.FC<{ students: Student[]; attendance: AttendanceRecord[]; professorAttendance: ProfessorAttendance[], showToast: (msg: string, type?: 'success'|'error') => void }> = ({ students, attendance, professorAttendance, showToast }) => {
+    
+    const attendanceByMonth = useMemo(() => {
+        const data = attendance.reduce((acc, record) => {
+            const date = record.timestamp.toDate();
+            const month = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+            acc[month] = (acc[month] || 0) + 1;
+            return acc;
+        }, {} as Record<string, number>);
+        return Object.entries(data).map(([name, Asistencias]) => ({ name, Asistencias })).sort((a,b) => a.name.localeCompare(b.name));
+    }, [attendance]);
+
+    const popularClasses = useMemo(() => {
+        const data = attendance.reduce((acc, record) => {
+            acc[record.className] = (acc[record.className] || 0) + 1;
+            return acc;
+        }, {} as Record<string, number>);
+        return Object.entries(data).map(([name, Asistencias]) => ({ name, Asistencias })).sort((a, b) => b.Asistencias - a.Asistencias);
+    }, [attendance]);
+
+    const newStudentsByMonth = useMemo(() => {
+        const data = students.reduce((acc, student) => {
+            const date = student.createdAt.toDate();
+            const month = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+            acc[month] = (acc[month] || 0) + 1;
+            return acc;
+        }, {} as Record<string, number>);
+        return Object.entries(data).map(([name, Nuevos]) => ({ name, Nuevos })).sort((a,b) => a.name.localeCompare(b.name));
+    }, [students]);
+
+    const handleExport = async (collectionRef: any, filename: string, headers: string[], mapping: Record<string, string>, orderByField?: string) => {
         try {
-            const data = await fb.getAllDocs(collectionRef);
+            const data = await fb.getAllDocs(collectionRef, orderByField);
             if(data.length === 0) {
                 showToast(`No hay datos para exportar en ${filename}`, 'error');
                 return;
@@ -1130,22 +1307,293 @@ const ExportarView: React.FC<{ showToast: (msg: string, type?: 'success'|'error'
     };
     
     return (
-         <div className="bg-gray-800 p-6 rounded-lg mb-8">
-            <h2 className="text-2xl font-semibold mb-4">Exportar Datos</h2>
-            <p className="text-gray-300 mb-6">Descarga copias de seguridad de tus datos en formato CSV, compatible con Excel.</p>
-            <div className="flex flex-col md:flex-row gap-4">
-                <button onClick={() => handleExport(fb.studentsCollection, 'alumnos.csv', ['name', 'sede', 'plan', 'classesRemaining'], {name: 'Nombre', sede: 'Sede', plan: 'Plan', classesRemaining: 'Clases Restantes'})} className="flex-1 bg-lime-500 text-gray-900 font-bold py-3 px-5 rounded-lg hover:bg-lime-400 transition-smooth flex items-center justify-center space-x-2">
-                    <IonIcon name="people-outline" className="text-xl" />
-                    <span>Exportar Alumnos</span>
+        <div className="space-y-8">
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                <div className="bg-gray-800 p-6 rounded-lg shadow-lg h-80">
+                    <h3 className="text-xl font-semibold mb-4">Asistencia por Mes</h3>
+                    <ResponsiveContainer width="100%" height="100%">
+                        <BarChart data={attendanceByMonth}>
+                            <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                            <XAxis dataKey="name" stroke="#9ca3af" />
+                            <YAxis stroke="#9ca3af" />
+                            <Tooltip contentStyle={{ backgroundColor: '#1f2937', border: '1px solid #374151' }} />
+                            <Bar dataKey="Asistencias" fill="#84cc16" />
+                        </BarChart>
+                    </ResponsiveContainer>
+                </div>
+                <div className="bg-gray-800 p-6 rounded-lg shadow-lg h-80">
+                    <h3 className="text-xl font-semibold mb-4">Clases Populares</h3>
+                    <ResponsiveContainer width="100%" height="100%">
+                        <BarChart data={popularClasses.slice(0, 5)} layout="vertical">
+                            <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                            <XAxis type="number" stroke="#9ca3af" />
+                            <YAxis type="category" dataKey="name" stroke="#9ca3af" width={120} />
+                            <Tooltip contentStyle={{ backgroundColor: '#1f2937', border: '1px solid #374151' }} />
+                            <Bar dataKey="Asistencias" fill="#22c55e" />
+                        </BarChart>
+                    </ResponsiveContainer>
+                </div>
+                 <div className="bg-gray-800 p-6 rounded-lg shadow-lg h-80 lg:col-span-2">
+                    <h3 className="text-xl font-semibold mb-4">Nuevos Alumnos por Mes</h3>
+                    <ResponsiveContainer width="100%" height="100%">
+                         <LineChart data={newStudentsByMonth}>
+                            <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                            <XAxis dataKey="name" stroke="#9ca3af" />
+                            <YAxis stroke="#9ca3af" />
+                            <Tooltip contentStyle={{ backgroundColor: '#1f2937', border: '1px solid #374151' }} />
+                            <Legend />
+                            <Line type="monotone" dataKey="Nuevos" stroke="#3b82f6" strokeWidth={2} />
+                        </LineChart>
+                    </ResponsiveContainer>
+                </div>
+            </div>
+            <div className="bg-gray-800 p-6 rounded-lg">
+                <h2 className="text-2xl font-semibold mb-4">Exportar Datos</h2>
+                <p className="text-gray-300 mb-6">Descarga copias de seguridad de tus datos en formato CSV, compatible con Excel.</p>
+                <div className="flex flex-col md:flex-row gap-4">
+                    <button onClick={() => handleExport(fb.studentsCollection, 'alumnos.csv', ['name', 'sede', 'plan', 'classesRemaining'], {name: 'Nombre', sede: 'Sede', plan: 'Plan', classesRemaining: 'Clases Restantes'})} className="flex-1 bg-lime-500 text-gray-900 font-bold py-3 px-5 rounded-lg hover:bg-lime-400 transition-smooth flex items-center justify-center space-x-2">
+                        <IonIcon name="people-outline" className="text-xl" />
+                        <span>Exportar Alumnos</span>
+                    </button>
+                    <button onClick={() => handleExport(fb.attendanceCollection, 'asistencia_alumnos.csv', ['timestamp', 'studentName', 'className', 'sede'], {timestamp: 'Fecha', studentName: 'Alumno', className: 'Clase', sede: 'Sede'}, 'timestamp')} className="flex-1 bg-blue-500 text-white font-bold py-3 px-5 rounded-lg hover:bg-blue-400 transition-smooth flex items-center justify-center space-x-2">
+                        <IonIcon name="list-outline" className="text-xl" />
+                        <span>Exportar Asistencia Alumnos</span>
+                    </button>
+                    <button onClick={() => handleExport(fb.professorAttendanceCollection, 'asistencia_profesores.csv', ['timestamp', 'professorName', 'className', 'sede', 'status'], {timestamp: 'Fecha', professorName: 'Profesor', className: 'Clase', sede: 'Sede', status: 'Estado'}, 'timestamp')} className="flex-1 bg-purple-500 text-white font-bold py-3 px-5 rounded-lg hover:bg-purple-400 transition-smooth flex items-center justify-center space-x-2">
+                        <IonIcon name="school-outline" className="text-xl" />
+                        <span>Exportar Asistencia Profesores</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+const PagosView: React.FC<{ students: Student[]; payments: Payment[]; showToast: (msg: string, type?: 'success' | 'error') => void }> = ({ students, payments, showToast }) => {
+    const [selectedStudentId, setSelectedStudentId] = useState('');
+    const [amount, setAmount] = useState(0);
+    const [isSubmitting, setSubmitting] = useState(false);
+
+    const handleStudentSelect = (studentId: string) => {
+        setSelectedStudentId(studentId);
+        const student = students.find(s => s.id === studentId);
+        if (student) {
+            const planKey = Object.keys(PLAN_DETAILS).find(key => PLAN_DETAILS[key].name.includes(student.plan)) || student.plan;
+            const priceString = PLAN_DETAILS[planKey]?.name.match(/S\/\s*(\d+)/)?.[1];
+            setAmount(priceString ? parseInt(priceString, 10) : 0);
+        }
+    };
+
+    const handleSubmit = async (e: React.FormEvent) => {
+        e.preventDefault();
+        const student = students.find(s => s.id === selectedStudentId);
+        if (!student || amount <= 0) {
+            showToast('Selecciona un alumno y un monto válido', 'error');
+            return;
+        }
+        setSubmitting(true);
+        try {
+            const planDetails = PLAN_DETAILS[student.plan];
+            if (!planDetails) throw new Error('Plan de alumno no válido');
+            
+            await fb.addPayment({
+                studentId: student.id,
+                studentName: student.name,
+                amount,
+                plan: student.plan,
+            });
+            await fb.renewStudentMembership(student.id, planDetails.classes);
+
+            showToast(`Pago de S/${amount} registrado para ${student.name}`);
+            setSelectedStudentId('');
+            setAmount(0);
+        } catch (err) {
+            console.error(err);
+            showToast('Error al registrar el pago', 'error');
+        } finally {
+            setSubmitting(false);
+        }
+    };
+
+    return (
+        <div className="space-y-8">
+            <div className="bg-gray-800 p-6 rounded-lg">
+                <h3 className="text-xl font-semibold mb-4">Registrar Pago</h3>
+                <form onSubmit={handleSubmit} className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <select value={selectedStudentId} onChange={e => handleStudentSelect(e.target.value)} className="md:col-span-2 bg-gray-700 p-2 rounded" required>
+                        <option value="">Seleccionar Alumno...</option>
+                        {students.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                    </select>
+                    <input type="number" value={amount} onChange={e => setAmount(Number(e.target.value))} placeholder="Monto (S/)" className="bg-gray-700 p-2 rounded" required />
+                    <button type="submit" disabled={isSubmitting} className="md:col-span-3 w-full bg-lime-500 text-gray-900 font-bold py-2 rounded transition-smooth h-10 flex items-center justify-center">
+                        {isSubmitting ? <Spinner size="sm" /> : 'Registrar Pago y Renovar Membresía'}
+                    </button>
+                </form>
+            </div>
+            <div className="bg-gray-800 p-4 rounded-lg">
+                <h3 className="text-xl font-semibold mb-4">Historial de Pagos</h3>
+                <div className="max-h-[50vh] overflow-y-auto">
+                    <table className="w-full min-w-full text-left">
+                        <thead><tr className="border-b border-gray-700">
+                            <th className="py-2 px-4">Fecha</th><th className="py-2 px-4">Alumno</th><th className="py-2 px-4">Monto</th>
+                        </tr></thead>
+                        <tbody>
+                            {payments.map(p => (
+                                <tr key={p.id} className="border-b border-gray-700">
+                                    <td className="py-2 px-4 text-gray-400">{p.paymentDate.toDate().toLocaleString('es-PE')}</td>
+                                    <td className="py-2 px-4 font-medium">{p.studentName}</td>
+                                    <td className="py-2 px-4">S/ {p.amount}</td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+const HorariosView: React.FC<{ schedule: GlobalSchedule[]; showToast: (msg: string, type?: 'success'|'error') => void }> = ({ schedule, showToast }) => {
+    const [day, setDay] = useState(DAYS_OF_WEEK[1]);
+    const [time, setTime] = useState('18:00');
+    const [className, setClassName] = useState(CLASS_OPTIONS[0]);
+    const [sede, setSede] = useState<'chimbote' | 'nuevo-chimbote'>('chimbote');
+
+    const handleAdd = async () => {
+        try {
+            await fb.addGlobalSchedule({ day, time, className, sede });
+            showToast('Clase añadida al horario general');
+        } catch (e) {
+            showToast('Error al añadir clase', 'error');
+        }
+    };
+    
+    const handleDelete = async (id: string) => {
+        try {
+            await fb.deleteGlobalSchedule(id);
+            showToast('Clase eliminada del horario');
+        } catch (e) {
+            showToast('Error al eliminar', 'error');
+        }
+    }
+
+    return (
+        <div className="space-y-8">
+             <div className="bg-gray-800 p-6 rounded-lg">
+                <h3 className="text-xl font-semibold mb-4">Añadir Clase al Horario General</h3>
+                 <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4 items-end">
+                    <select value={day} onChange={e => setDay(e.target.value)} className="bg-gray-700 p-2 rounded">
+                        {DAYS_OF_WEEK.filter(d=>d !== "Domingo").map(d => <option key={d} value={d}>{d}</option>)}
+                    </select>
+                     <input type="time" value={time} onChange={e => setTime(e.target.value)} className="bg-gray-700 p-2 rounded" />
+                     <select value={className} onChange={e => setClassName(e.target.value)} className="bg-gray-700 p-2 rounded">
+                        {CLASS_OPTIONS.map(c => <option key={c} value={c}>{c}</option>)}
+                    </select>
+                     <select value={sede} onChange={e => setSede(e.target.value as any)} className="bg-gray-700 p-2 rounded">
+                        <option value="chimbote">Chimbote</option>
+                        <option value="nuevo-chimbote">Nuevo Chimbote</option>
+                    </select>
+                </div>
+                <button onClick={handleAdd} className="w-full mt-4 bg-lime-500 text-gray-900 font-bold py-2 rounded transition-smooth">Añadir Clase</button>
+            </div>
+            <div className="bg-gray-800 p-4 rounded-lg">
+                <h3 className="text-xl font-semibold mb-4">Horario General Actual</h3>
+                <div className="space-y-2 max-h-[50vh] overflow-y-auto">
+                    {schedule.length > 0 ? schedule.map(s => (
+                        <div key={s.id} className="bg-gray-700 p-2 rounded flex justify-between items-center">
+                            <span>{s.day} {s.time} - {s.className} ({s.sede})</span>
+                            <button onClick={() => handleDelete(s.id)} className="text-red-400 hover:text-red-300 transition-smooth"><IonIcon name="trash-outline"/></button>
+                        </div>
+                    )) : <p className="text-gray-500 text-center">No hay clases en el horario general.</p>}
+                </div>
+            </div>
+        </div>
+    );
+};
+
+const ProfessorDashboardScreen: React.FC<{ 
+    professor: Professor; 
+    attendance: AttendanceRecord[]; 
+    onLogout: () => void;
+    globalSchedule: GlobalSchedule[];
+    showToast: (msg: string, type?: 'success' | 'error') => void;
+}> = ({ professor, attendance, onLogout, globalSchedule, showToast }) => {
+    const [schedule, setSchedule] = useState<Schedule[]>([]);
+    const { checkinState, handleCheckin } = useProfessorCheckinStatus(professor, globalSchedule, showToast);
+    
+    useEffect(() => {
+        const unsub = fb.getProfessorSchedule(professor.id, setSchedule);
+        return () => unsub();
+    }, [professor.id]);
+
+    const scheduleByDay = useMemo(() => {
+        return schedule.reduce((acc, s) => {
+            (acc[s.day] = acc[s.day] || []).push(s);
+            return acc;
+        }, {} as Record<string, Schedule[]>);
+    }, [schedule]);
+
+    const recentCheckins = useMemo(() => {
+        const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+        return attendance.filter(a => a.timestamp.toDate() > oneHourAgo && a.sede === professor.sede);
+    }, [attendance, professor.sede]);
+
+    const checkinButtonDisabled = checkinState.status !== 'idle';
+    const checkinButtonText = {
+        'idle': 'Marcar Asistencia',
+        'checking': 'Verificando...',
+        'checked-in': 'Asistencia Marcada',
+        'no-class': 'Marcar Asistencia',
+        'error': 'Reintentar Asistencia'
+    }[checkinState.status];
+
+    return (
+        <div className="fade-in space-y-8">
+            <div className="flex justify-between items-center">
+                <div>
+                    <h2 className="text-3xl font-bold">Bienvenido, {professor.name}</h2>
+                    <p className="text-gray-400">Sede {professor.sede === 'chimbote' ? 'Chimbote' : 'Nuevo Chimbote'}</p>
+                </div>
+                <button onClick={onLogout} className="bg-gray-700 hover:bg-gray-600 text-white font-bold py-2 px-4 rounded-lg transition-smooth flex items-center space-x-2">
+                    <IonIcon name="log-out-outline" />
+                    <span>Salir</span>
                 </button>
-                 <button onClick={() => handleExport(fb.attendanceCollection, 'asistencia_alumnos.csv', ['timestamp', 'studentName', 'className', 'sede'], {timestamp: 'Fecha', studentName: 'Alumno', className: 'Clase', sede: 'Sede'})} className="flex-1 bg-blue-500 text-white font-bold py-3 px-5 rounded-lg hover:bg-blue-400 transition-smooth flex items-center justify-center space-x-2">
-                    <IonIcon name="list-outline" className="text-xl" />
-                    <span>Exportar Asistencia Alumnos</span>
-                </button>
-                 <button onClick={() => handleExport(fb.professorAttendanceCollection, 'asistencia_profesores.csv', ['timestamp', 'professorName', 'className', 'sede', 'status'], {timestamp: 'Fecha', professorName: 'Profesor', className: 'Clase', sede: 'Sede', status: 'Estado'})} className="flex-1 bg-purple-500 text-white font-bold py-3 px-5 rounded-lg hover:bg-purple-400 transition-smooth flex items-center justify-center space-x-2">
-                    <IonIcon name="school-outline" className="text-xl" />
-                    <span>Exportar Asistencia Profesores</span>
-                </button>
+            </div>
+
+             <div className="bg-gray-800 p-6 rounded-lg text-center">
+                 <button onClick={handleCheckin} disabled={checkinButtonDisabled} className={`w-full max-w-md mx-auto text-lg font-bold py-4 px-4 rounded-lg transition-smooth h-16 flex items-center justify-center space-x-3
+                    ${!checkinButtonDisabled ? 'bg-lime-500 text-gray-900 hover:bg-lime-400' : 'bg-gray-700 text-gray-500 cursor-not-allowed'}`}>
+                     {checkinState.status === 'checking' ? <Spinner /> : <IonIcon name="checkmark-circle-outline" className="text-2xl" />}
+                     <span>{checkinButtonText}</span>
+                 </button>
+                 <p className="text-gray-400 text-sm mt-3 h-5">{checkinState.message}</p>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                <div className="md:col-span-2 bg-gray-800 p-6 rounded-lg">
+                    <h3 className="text-xl font-semibold mb-4">Tu Horario Semanal</h3>
+                    <div className="space-y-4">
+                        {Object.keys(scheduleByDay).length > 0 ? DAYS_OF_WEEK.filter(d => scheduleByDay[d]).map(day => (
+                            <div key={day}>
+                                <h4 className="font-bold text-lime-500">{day}</h4>
+                                <ul className="list-disc list-inside text-gray-300">
+                                    {scheduleByDay[day].map(s => <li key={s.id}>{s.time} - {s.className}</li>)}
+                                </ul>
+                            </div>
+                        )) : <p className="text-gray-500">No tienes un horario personal asignado. Puedes marcar asistencia para las clases del horario general de tu sede.</p>}
+                    </div>
+                </div>
+                <div className="bg-gray-800 p-6 rounded-lg">
+                    <h3 className="text-xl font-semibold mb-4">Check-ins Recientes</h3>
+                    <div className="space-y-2 max-h-96 overflow-y-auto">
+                        {recentCheckins.length > 0 ? recentCheckins.map(a => (
+                            <div key={a.id} className="bg-gray-700 p-3 rounded-lg">
+                                <p className="font-semibold">{a.studentName}</p>
+                                <p className="text-xs text-gray-400">{a.className} - {a.timestamp.toDate().toLocaleTimeString()}</p>
+                            </div>
+                        )) : <p className="text-gray-500">No hay check-ins recientes.</p>}
+                    </div>
+                </div>
             </div>
         </div>
     );
@@ -1175,7 +1623,8 @@ const EditStudentModal: React.FC<{ student: Student, onClose: () => void, showTo
             const { id, ...dataToSave } = formData;
             await fb.updateStudent(student.id, {
                 ...dataToSave,
-                classesRemaining: Number(formData.classesRemaining)
+                classesRemaining: Number(formData.classesRemaining),
+                membershipExpiresAt: formData.membershipExpiresAt, // Already a timestamp
             });
             showToast('Alumno actualizado');
             onClose();
@@ -1214,9 +1663,18 @@ const EditStudentModal: React.FC<{ student: Student, onClose: () => void, showTo
                         </select>
                     </div>
                 </div>
-                <div>
-                    <label className="text-sm text-gray-400">Clases Restantes</label>
-                    <input type="number" name="classesRemaining" value={formData.classesRemaining} onChange={handleChange} className="w-full bg-gray-700 p-2 rounded mt-1" />
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div>
+                        <label className="text-sm text-gray-400">Clases Restantes</label>
+                        <input type="number" name="classesRemaining" value={formData.classesRemaining} onChange={handleChange} className="w-full bg-gray-700 p-2 rounded mt-1" />
+                    </div>
+                     <div>
+                        <label className="text-sm text-gray-400">Vencimiento</label>
+                        <input type="date" name="membershipExpiresAt" 
+                               value={formData.membershipExpiresAt ? formData.membershipExpiresAt.toDate().toISOString().split('T')[0] : ''} 
+                               onChange={e => setFormData({...formData, membershipExpiresAt: e.target.value ? fb.Timestamp.fromDate(new Date(e.target.value)) : null})} 
+                               className="w-full bg-gray-700 p-2 rounded mt-1" />
+                    </div>
                 </div>
                 <div>
                     <label className="text-sm text-gray-400">Notas (privado)</label>
